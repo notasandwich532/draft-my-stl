@@ -1,0 +1,9 @@
+# Reconstruction dependencies — requires Python <=3.11 (open3d limitation)
+# Create a separate venv:
+#   python3.10 -m venv venv-reconstruct
+#   source venv-reconstruct/bin/activate
+#   pip install -r requirements-reconstruct.txt
+# Then update the shebang in rebuild.py to point at this venv's python.
+
+open3d
+tomli

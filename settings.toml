@@ -1,0 +1,39 @@
+# -------------------------------------------------------
+# Draft pipeline settings
+# Edit this file — worker.py, controller.py, combiner.py all read it.
+# -------------------------------------------------------
+
+[mesh]
+input_file         = "../my_model.stl"
+output_file        = "output.stl"
+reconstruct_input  = "output.stl"   # input to rebuild.py (defaults to output_file)
+reconstruct_output = "rebuilt.stl"  # final reconstructed mesh
+
+[voxel]
+voxel_size      = 0.1   # mm per voxel
+draft_angle_deg = 3   # degrees of draft
+pad             = 8    # voxel padding (fallback if not running via controller)
+
+[tiling]
+tile_size   = 15.0  # XY tile size in mm
+overlap     = 5.0   # overlap in mm (fallback — controller auto-computes from mesh height)
+max_workers = 6     # parallel worker processes
+
+[combine]
+max_faces_per_mesh = 200000
+max_intermediate_faces = 2000000  # decimate batch/round results above this (0 = skip)
+final_face_count = 800000  # target faces for final output (0 = skip decimation)
+
+[paths]
+tiles_dir     = "tiles"
+processed_dir = "processed"
+reduced_dir   = "reduced"
+worker_script = "./worker.py"
+merge_script  = "./merge_complanar.py"
+debug_dir     = "debug_combine"
+
+[reconstruct]
+point_count         = 500000  # points sampled from mesh for Poisson
+poisson_depth       = 8       # 8=smoother, 9=balanced, 10=more detail
+smoothing_iterations = 10     # Taubin smoothing passes (0 to disable)
+density_trim        = 0    # remove lowest N fraction of density vertices (0 to disable)

@@ -1,8 +1,8 @@
 # Draft My STL
 
-**This code was written by Claude (Anthropic's AI assistant).** It is provided as-is. If something doesn't work, consult an AI — it will be able to help you debug it faster than any issue tracker.
+**This code was written by Claude** It is provided as-is. If something doesn't work, consult an AI — it will be able to help you debug it faster than any issue tracker.
 
-A pipeline for preparing organic 3D mesh files for sand casting molds. It fills in undercuts (overhanging geometry that would trap a mold), applies draft angles to all surfaces, and produces a clean reconstructed mesh ready for mold making.
+A pipeline for preparing organic shaped 3D mesh files for sand casting molds. It fills in undercuts (overhanging geometry that would trap a mold), applies draft angles to all surfaces, and produces a clean reconstructed mesh ready for mold making.
 
 > **Tested on:** Linux only · 32GB RAM · Intel i7-10750H · Resolution ≥ 0.1mm
 

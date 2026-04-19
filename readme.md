@@ -6,6 +6,10 @@ A pipeline for preparing organic 3D mesh files for sand casting molds. It fills 
 
 > **Tested on:** Linux only · 32GB RAM · Intel i7-10750H · Resolution ≥ 0.1mm
 
+| Before | After |
+|---|---|
+| ![Before](before.png) | ![After](after.png) |
+
 ---
 
 ## What it does
@@ -137,5 +141,6 @@ Set depth so that `model_size / 2^depth ≈ voxel_size`:
 - Two output meshes are always produced: `rebuilt_raw.stl` (no smoothing) and `rebuilt.stl` (smoothed) — compare both and use whichever suits your application
 - Set `TILE_DEBUG = True` at the top of `controller.py` to print detailed per-tile clipping info when diagnosing tiling problems
 - **If `tiles/`, `processed/`, or `reduced/` are not cleared between runs, their existing contents will be reused.** This is intentional — it lets you resume a failed run without re-processing everything. If you change settings or your input model, delete these directories before running again to avoid stale data
+- **Voxel artifacts** — at the current resolution some voxel stepping may be visible in the output mesh and even after printing. These surface artifacts are unlikely to come through in the final cast piece as the sand casting process naturally smooths fine surface detail
 - Only tested on Linux — Windows and macOS are untested
 - Only tested on a 32GB system — lower RAM may work for smaller models at coarser resolution but is untested

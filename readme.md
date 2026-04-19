@@ -14,7 +14,7 @@ A pipeline for preparing organic shaped 3D mesh files for sand casting molds. It
 
 ## What it does
 
-Sand casting requires that a pattern can be pulled cleanly from the mold — this means no undercuts and all vertical surfaces must have a slight outward taper (the "draft angle"). This pipeline automates that process:
+Sand casting requires that a pattern can be pulled cleanly from the mold — this means no undercuts and all vertical surfaces should have a slight outward taper (the "draft angle"). This pipeline automates that process:
 
 1. **Tiles** the mesh into overlapping sections so large models can be processed in parallel
 2. **Voxelizes** each tile at a chosen resolution

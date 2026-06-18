@@ -41,7 +41,7 @@ def tick(label):
     print(f"  [{now - _t:6.2f}s] {label}", flush=True)
     _t = now
 
-print(f"\n── Processing {INPUT_FILE} ──", flush=True)
+print(f"\n-- Processing {INPUT_FILE} --", flush=True)
 print(f"  PAD={PAD}  OVERLAP={OVERLAP:.2f}mm", flush=True)
 
 # -----------------------------
@@ -70,7 +70,7 @@ if os.path.exists(offset_file):
     z_offset = float(offsets.get(tile_id_str, 0.0))
     print(f"  Z offset from JSON [{tile_id_str}]: {z_offset:.6f}")
 else:
-    print(f"  WARNING: offsets.json not found — using 0.0")
+    print(f"  WARNING: offsets.json not found -- using 0.0")
 
 # -----------------------------
 # APPLY OFFSET BEFORE VOXEL
@@ -81,7 +81,7 @@ if z_offset != 0.0:
 # -----------------------------
 # VOXELIZE
 # -----------------------------
-print("\n── Voxelizing ──")
+print("\n-- Voxelizing --")
 tick("start")
 
 vox    = mesh.voxelized(pitch=VOXEL_SIZE, method='ray')
@@ -168,9 +168,13 @@ for z in reversed(range(top_solid_z)):
 # -----------------------------
 # SMOOTH
 # -----------------------------
-# size=2 uniform filter eats 1 voxel from every surface — use a lighter
-# smooth that cleans noise without shrinking the top/sides of the model
-smoothed = ndimage.uniform_filter(draft.astype(np.float32), size=1.5) > 0.5
+# Anisotropic gaussian: smooth aggressively in XY to recover circular
+# cross-sections from the voxel staircase, but keep Z tight to preserve
+# sharp horizontal edges between draft steps.
+# sigma=[XY, XY, Z] — XY=1.5 blends ~3 voxels to round square corners
+# into circles, Z=0.3 keeps vertical resolution mostly intact.
+from scipy.ndimage import gaussian_filter
+smoothed = gaussian_filter(draft.astype(np.float32), sigma=[1.5, 1.5, 0.3]) > 0.5
 
 # -----------------------------
 # MARCHING CUBES
@@ -226,7 +230,7 @@ out.fix_normals()
 # -----------------------------
 # DEBUG
 # -----------------------------
-print(f"\n── Debug ──")
+print(f"\n-- Debug --")
 print(f"  Faces: {len(out.faces)}")
 print(f"  Watertight: {out.is_watertight}")
 

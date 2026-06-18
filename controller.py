@@ -1,13 +1,44 @@
-#!/usr/bin/env python3
+#!/bin/python3
 
 import os
 import sys
-import tomllib
 import subprocess
+
+# -----------------------------
+# DEPENDENCY CHECK
+# -----------------------------
+_REQUIRED = {
+    "trimesh":      "trimesh",
+    "numpy":        "numpy",
+    "tqdm":         "tqdm",
+    "scipy":        "scipy",
+    "skimage":      "scikit-image",
+    "open3d":       "open3d",
+    "shapely":      "shapely",
+    "manifold3d":   "manifold3d",
+    "rtree":        "rtree",
+    "mapbox_earcut":"mapbox-earcut",
+}
+
+_missing = []
+for _mod, _pkg in _REQUIRED.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing.append(_pkg)
+
+if _missing:
+    print("ERROR: missing dependencies. Install with:")
+    print(f"  pip install {' '.join(_missing)}")
+    sys.exit(1)
+
+print(f"[OK] All dependencies present ({', '.join(_REQUIRED)})")
+
+import tomllib
 import numpy as np
 import trimesh
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 
 # -----------------------------
@@ -35,7 +66,7 @@ DRAFT_ANGLE_DEG  = float(cfg["voxel"]["draft_angle_deg"])
 
 WORKER_PATH = os.path.abspath(WORKER)
 
-TILE_DEBUG = False  # set True to print per-plane clip info for each tile
+TILE_DEBUG = False  # set True to print per-plane clip debug
 
 os.makedirs(TILES_DIR,     exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
@@ -75,18 +106,18 @@ print(f"  Auto pad         : {PAD} voxels")
 # -----------------------------
 def clip_to_box(mesh, xmin, xmax, ymin, ymax, debug_label=""):
     m = mesh.copy()
-
     center = mesh.bounds.mean(axis=0)
 
     def dbg(stage, m):
         if not TILE_DEBUG: return
         if m is None: print(f"    [{debug_label}] {stage}: NONE")
         else:         print(f"    [{debug_label}] {stage}: faces={len(m.faces)}")
+
     if TILE_DEBUG:
-        print(f"  TILE {debug_label} x[{xmin:.1f},{xmax:.1f}] y[{ymin:.1f},{ymax:.1f}]")
+        print(f"\n  === TILE {debug_label} === x[{xmin:.1f},{xmax:.1f}] y[{ymin:.1f},{ymax:.1f}]")
 
     try:
-        m = trimesh.intersections.slice_mesh_plane(m, plane_normal=[1,0,0], plane_origin=[xmin, center[1], center[2]])
+        m = trimesh.intersections.slice_mesh_plane(m, plane_normal=[1,0,0],  plane_origin=[xmin, center[1], center[2]])
         dbg("xmin", m)
         if m is None or len(m.faces) == 0: return None
 
@@ -94,7 +125,7 @@ def clip_to_box(mesh, xmin, xmax, ymin, ymax, debug_label=""):
         dbg("xmax", m)
         if m is None or len(m.faces) == 0: return None
 
-        m = trimesh.intersections.slice_mesh_plane(m, plane_normal=[0,1,0], plane_origin=[center[0], ymin, center[2]])
+        m = trimesh.intersections.slice_mesh_plane(m, plane_normal=[0,1,0],  plane_origin=[center[0], ymin, center[2]])
         dbg("ymin", m)
         if m is None or len(m.faces) == 0: return None
 
@@ -103,19 +134,18 @@ def clip_to_box(mesh, xmin, xmax, ymin, ymax, debug_label=""):
         if m is None or len(m.faces) == 0: return None
 
     except Exception as e:
-        if TILE_DEBUG: print(f"    [{debug_label}] EXCEPTION: {e}")
+        print(f"    [{debug_label}] EXCEPTION: {e}")
         return None
 
     m.remove_unreferenced_vertices()
     m.merge_vertices()
     m.fix_normals()
-
     return m
 
 # -----------------------------
 # GENERATE TILES
 # -----------------------------
-print("\n------------------------------------------------------------\n  TILING\n------------------------------------------------------------")
+print(f"\n{'-'*60}\n  TILING\n{'-'*60}")
 
 xs_range = np.arange(min_corner[0], max_corner[0], TILE_SIZE)
 ys_range = np.arange(min_corner[1], max_corner[1], TILE_SIZE)
@@ -174,7 +204,7 @@ offset_file = os.path.join(TILES_DIR, "offsets.json")
 with open(offset_file, "w") as f:
     json.dump(offsets, f, indent=2)
 
-print(f"Saved offsets → {offset_file}")
+print(f"Saved offsets -> {offset_file}")
 
 # -----------------------------
 # PARALLEL WORKERS
@@ -184,7 +214,7 @@ def run_worker(tile):
         return tile["out_file"], "skipped", None
 
     result = subprocess.run(
-        ["python3", WORKER_PATH, tile["tile_file"], tile["out_file"], SETTINGS,
+        [sys.executable, WORKER_PATH, tile["tile_file"], tile["out_file"], SETTINGS,
          str(OVERLAP), str(PAD)],
         capture_output=True,
         text=True,
@@ -195,10 +225,10 @@ def run_worker(tile):
 
     return tile["out_file"], "ok", None
 
-print(f"\n------------------------------------------------------------\n  DRAFTING  ({len(tile_meta)} tiles, {MAX_WORKERS} workers)\n------------------------------------------------------------")
+print(f"\n{'-'*60}\n  DRAFTING  ({len(tile_meta)} tiles, {MAX_WORKERS} workers)\n{'-'*60}")
 failed = []
 
-with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     futures = {executor.submit(run_worker, t): t for t in tile_meta}
     with tqdm(total=len(tile_meta), desc="Workers") as pbar:
         for future in as_completed(futures):
@@ -214,7 +244,7 @@ if failed:
 # -----------------------------
 # MERGE COPLANAR (triangle reduction)
 # -----------------------------
-print(f"\n------------------------------------------------------------\n  REDUCING  -> {REDUCED_DIR}/\n------------------------------------------------------------")
+print(f"\n{'-'*60}\n  REDUCING  -> {REDUCED_DIR}/\n{'-'*60}")
 
 MERGE_PATH = os.path.abspath(MERGE_SCRIPT)
 
@@ -230,7 +260,7 @@ def run_merge(tile):
         return out_file, "skipped", None
 
     result = subprocess.run(
-        ["python3", MERGE_PATH, in_file, out_file, "--quiet"],
+        [sys.executable, MERGE_PATH, in_file, out_file, "--quiet"],
         capture_output=True,
         text=True,
     )
@@ -242,7 +272,7 @@ def run_merge(tile):
 
 merge_failed = []
 
-with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     futures = {executor.submit(run_merge, t): t for t in tile_meta}
     with tqdm(total=len(tile_meta), desc="Reducing") as pbar:
         for future in as_completed(futures):
@@ -264,16 +294,18 @@ if merge_failed:
             shutil.copyfile(t["out_file"], reduced)  # copyfile = bytes only, no metadata (WSL safe)
             print(f"  Copied original: {os.path.basename(t['out_file'])}")
 
+# ── Combine ───────────────────────────────────────────────────────────────────
 COMBINER_PATH = os.path.abspath(cfg["paths"].get("combiner_script", "./combiner.py"))
-print(f"\n------------------------------------------------------------\n  COMBINING\n------------------------------------------------------------")
-result = subprocess.run(["python3", COMBINER_PATH, SETTINGS], text=True)
+print(f"\n{'-'*60}\n  COMBINING\n{'-'*60}")
+result = subprocess.run([sys.executable, COMBINER_PATH, SETTINGS], text=True)
 if result.returncode != 0:
     print(f"WARNING: combiner exited with code {result.returncode}")
 
+# ── Reconstruct ───────────────────────────────────────────────────────────────
 REBUILD_PATH = os.path.abspath(cfg["paths"].get("rebuild_script", "./rebuild.py"))
-print(f"\n------------------------------------------------------------\n  RECONSTRUCTION\n------------------------------------------------------------")
-result = subprocess.run([REBUILD_PATH, SETTINGS], text=True)
+print(f"\n{'-'*60}\n  RECONSTRUCTION\n{'-'*60}")
+result = subprocess.run([sys.executable, REBUILD_PATH, SETTINGS], text=True)
 if result.returncode != 0:
     print(f"WARNING: rebuild exited with code {result.returncode}")
 
-print(f"\n============================================================\n  PIPELINE COMPLETE\n============================================================\n")
+print(f"\n{'='*60}\n  PIPELINE COMPLETE\n{'='*60}\n")

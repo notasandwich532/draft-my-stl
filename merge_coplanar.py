@@ -27,15 +27,17 @@ import sys
 import argparse
 import traceback
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 import trimesh
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components as _scipy_cc
 
 try:
     import mapbox_earcut as earcut
     HAS_EARCUT = True
-    print("[INFO] mapbox-earcut found ✅")
+    print("[INFO] mapbox-earcut found [OK]")
 except ImportError:
     HAS_EARCUT = False
     print("[WARN] mapbox-earcut not found.")
@@ -74,7 +76,7 @@ MIN_AREA  = 1e-6
 
 def face_info(mesh, label=""):
     wt  = mesh.is_watertight
-    tag = "✅ watertight" if wt else "❌ NOT watertight"
+    tag = "[OK] watertight" if wt else "[!!] NOT watertight"
     print(f"  [{label}] faces={len(mesh.faces):,}  verts={len(mesh.vertices):,}  "
           f"euler={mesh.euler_number}  bodies={mesh.body_count}  {tag}")
     return wt
@@ -132,7 +134,13 @@ def connected_components_faces(face_subset_indices, all_faces):
 
 
 def cluster_axis_aligned(mesh, dist_tol=1e-4):
-    print(f"\n[cluster] Classifying {len(mesh.faces):,} face normals …")
+    """
+    Cluster axis-aligned faces by plane + connected component.
+    Fully vectorized: builds face-face adjacency with numpy argsort, then runs
+    scipy connected_components once on the whole aligned-face graph.
+    ~10x faster than the Python DFS approach for large meshes.
+    """
+    print(f"\n[cluster] Classifying {len(mesh.faces):,} face normals ...")
 
     axis_ids = classify_face_normals(mesh.face_normals)
     aligned  = np.where(axis_ids >= 0)[0]
@@ -140,27 +148,77 @@ def cluster_axis_aligned(mesh, dist_tol=1e-4):
     if len(aligned) == 0:
         return []
 
+    n_al    = len(aligned)
     ax      = axis_ids[aligned]
     normals = AXIS_NORMALS[ax]
     v0      = mesh.vertices[mesh.faces[aligned, 0]]
     offsets = np.einsum('ij,ij->i', normals, v0)
     q_off   = np.round(offsets / dist_tol).astype(np.int64)
 
-    plane_bucket = defaultdict(list)
-    for i, gi in enumerate(aligned):
-        plane_bucket[(int(ax[i]), int(q_off[i]))].append(gi)
+    # Unique plane key per (axis, quantized_offset)
+    q_min   = q_off.min()
+    q_range = int(q_off.max() - q_min) + 1
+    pk      = ax.astype(np.int64) * q_range + (q_off - q_min)  # plane_key[i]
+
+    # ── build face-face adjacency via edge matching ───────────────────────────
+    tris    = mesh.faces[aligned]                    # (n_al, 3)
+    n_v     = np.int64(int(mesh.faces.max()) + 1)
+
+    # Pack all 3 edges per face into sorted int64 keys
+    e0a = np.minimum(tris[:,0], tris[:,1]).astype(np.int64)
+    e0b = np.maximum(tris[:,0], tris[:,1]).astype(np.int64)
+    e1a = np.minimum(tris[:,1], tris[:,2]).astype(np.int64)
+    e1b = np.maximum(tris[:,1], tris[:,2]).astype(np.int64)
+    e2a = np.minimum(tris[:,2], tris[:,0]).astype(np.int64)
+    e2b = np.maximum(tris[:,2], tris[:,0]).astype(np.int64)
+    ep  = np.concatenate([e0a*n_v+e0b, e1a*n_v+e1b, e2a*n_v+e2b])  # 3*n_al edges
+    fi  = np.tile(np.arange(n_al, dtype=np.int32), 3)                # local face idx
+
+    # Sort by edge key to find shared edges as consecutive identical keys
+    order   = np.argsort(ep, kind='stable')
+    s_ep    = ep[order]
+    s_fi    = fi[order]
+    eq      = s_ep[:-1] == s_ep[1:]
+    lf      = s_fi[:-1][eq]
+    rf      = s_fi[1:] [eq]
+
+    # Only connect faces on the SAME plane
+    same    = pk[lf] == pk[rf]
+    lf      = lf[same]
+    rf      = rf[same]
+
+    # Build sparse adjacency and run connected_components in one call
+    if len(lf) > 0:
+        rows = np.concatenate([lf, rf]).astype(np.int32)
+        cols = np.concatenate([rf, lf]).astype(np.int32)
+        data = np.ones(len(rows), dtype=np.int8)
+        adj  = csr_matrix((data, (rows, cols)), shape=(n_al, n_al))
+        _, labels = _scipy_cc(adj, directed=False)
+    else:
+        labels = np.arange(n_al, dtype=np.int32)
+
+    # Unique component key = (plane_key, component_label)
+    # Components from different planes can share a label so we combine both.
+    n_comps  = int(labels.max()) + 1
+    combo    = pk * (n_comps + 1) + labels.astype(np.int64)
+
+    # Sort by combo to group faces into components
+    sort_idx      = np.argsort(combo, kind='stable')
+    s_combo       = combo[sort_idx]
+    s_aligned     = aligned[sort_idx]
+    s_ax          = ax[sort_idx]
+    breaks        = np.where(np.diff(s_combo))[0] + 1
+    starts        = np.concatenate([[0], breaks])
+    ends          = np.concatenate([breaks, [n_al]])
 
     all_comps = []
-    for (aid, _), fl in plane_bucket.items():
-        fi_arr = np.array(fl, dtype=np.int64)
-        if len(fi_arr) < 2:
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        if e - s < 2:
             continue
-        for comp in connected_components_faces(fi_arr, mesh.faces):
-            if len(comp) >= 2:
-                all_comps.append((aid, comp))
+        all_comps.append((int(s_ax[s]), s_aligned[s:e]))
 
     all_comps.sort(key=lambda x: -len(x[1]))
-    print(f"[cluster] Components ≥2 faces : {len(all_comps):,}")
+    print(f"[cluster] Components >=2 faces : {len(all_comps):,}")
     if all_comps:
         sizes = [len(c) for _, c in all_comps]
         print(f"[cluster] Largest={sizes[0]:,}  median={int(np.median(sizes)):,}")
@@ -265,7 +323,7 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
 
     tri = all_faces[face_indices]
     print(f"\n{'='*70}")
-    print(f"  DIAGNOSE C{cid:05d}  axis={['−Z','+Z','−X','+X','−Y','+Y'][axis_id]}  n_input_faces={len(face_indices)}")
+    print(f"  DIAGNOSE C{cid:05d}  axis={['-Z','+Z','-X','+X','-Y','+Y'][axis_id]}  n_input_faces={len(face_indices)}")
 
     # ── edge census ──────────────────────────────────────────────────────────
     edge_count    = defaultdict(int)
@@ -324,7 +382,7 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
         for j in range(i+1, len(all_loop_sets)):
             shared = all_loop_sets[i] & all_loop_sets[j]
             if shared:
-                print(f"  ⚠️  Loops {i} and {j} share vertices: {shared}")
+                print(f"  [!!]Loops {i} and {j} share vertices: {shared}")
 
     # Check for vertices with degree != 2 in boundary
     from collections import Counter
@@ -334,9 +392,9 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
         bdeg[b] += 1
     bad_verts = {v: d for v,d in bdeg.items() if d != 2}
     if bad_verts:
-        print(f"  ⚠️  {len(bad_verts)} boundary verts with degree != 2: {dict(list(bad_verts.items())[:10])}")
+        print(f"  [!!]{len(bad_verts)} boundary verts with degree != 2: {dict(list(bad_verts.items())[:10])}")
     else:
-        print(f"  ✅ All boundary verts have degree 2")
+        print(f"  [OK] All boundary verts have degree 2")
 
     # ── per-loop analysis ────────────────────────────────────────────────────
     loops_2d = []
@@ -389,7 +447,7 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
         valid = ((ring_faces[:,0]!=ring_faces[:,1])&(ring_faces[:,1]!=ring_faces[:,2])&(ring_faces[:,0]!=ring_faces[:,2]))
         ring_faces = ring_faces[valid]
         expected = len(lp) - 2
-        print(f"  Ring {idx} (n={len(lp)}, a={a:.3f}): earcut→{len(ring_faces)} tris (expected {expected})")
+        print(f"  Ring {idx} (n={len(lp)}, a={a:.3f}): earcut->{len(ring_faces)} tris (expected {expected})")
         # check for any edge in ring_faces that also appears in boundary_edges
         ring_edge_count = defaultdict(int)
         for f in ring_faces:
@@ -398,8 +456,8 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
                 ring_edge_count[(min(a2,b2),max(a2,b2))] += 1
         new_edges = [e for e in ring_edge_count if e not in edge_count]
         shared_bdry = [e for e in ring_edge_count if edge_count.get(e,0)==1]
-        print(f"    → {len(new_edges)} NEW interior edges (not in original mesh)")
-        print(f"    → {len(shared_bdry)} edges shared with original boundary (will be doubled → interior)")
+        print(f"    -> {len(new_edges)} NEW interior edges (not in original mesh)")
+        print(f"    -> {len(shared_bdry)} edges shared with original boundary (will be doubled -> interior)")
         ring_results.append(ring_faces)
         total_new += len(ring_faces)
 
@@ -425,9 +483,9 @@ def diagnose_component(mesh, axis_id, face_indices, cid):
         print(f"  Open edges (cnt=1) : {open_edges}")
         print(f"  Non-manifold (cnt>2): {multi_edges}")
         if open_edges == 0 and multi_edges == 0:
-            print(f"  ✅ Would be WATERTIGHT")
+            print(f"  [OK] Would be WATERTIGHT")
         else:
-            print(f"  ❌ NOT watertight")
+            print(f"  [!!] NOT watertight")
             # Show some open edges
             open_ex = [(e,ec[e]) for e in ec if ec[e]==1][:5]
             print(f"  Open edge examples: {open_ex}")
@@ -459,7 +517,7 @@ def merge_component(mesh, axis_id, face_indices, cid, debug=True):
     # ── boundary loops ────────────────────────────────────────────────────
     loops_vi = get_boundary_loops(face_indices, mesh.faces)
     if loops_vi is None:
-        if debug: print("  → no boundary")
+        if debug: print("  -> no boundary")
         return None
 
     # ── project to 2D ─────────────────────────────────────────────────────
@@ -474,7 +532,7 @@ def merge_component(mesh, axis_id, face_indices, cid, debug=True):
     keep = [(lp, p2d, a) for lp, p2d, a in zip(loops_vi, loops_2d, areas)
             if abs(a) >= MIN_AREA]
     if not keep:
-        if debug: print("  → all degenerate")
+        if debug: print("  -> all degenerate")
         return None
 
     # ── sort by |area| descending ─────────────────────────────────────────
@@ -541,13 +599,13 @@ def merge_component(mesh, axis_id, face_indices, cid, debug=True):
         # For +Z: skip outers with no holes — they are open surface holes
         if axis_id == PLUS_Z and len(hole_lps) == 0:
             if debug:
-                print(f"  [skip] +Z outer with no children — open surface hole")
+                print(f"  [skip] +Z outer with no children -- open surface hole")
             continue
 
         clusters.append((lp_o, p2d_o, hole_lps, hole_2ds))
 
     if not clusters:
-        if debug: print("  → no clusters")
+        if debug: print("  -> no clusters")
         return None
 
     n_outers = len(clusters)
@@ -635,13 +693,13 @@ def merge_component(mesh, axis_id, face_indices, cid, debug=True):
                 all_new_faces.append(tris)
 
     if not all_new_faces:
-        if debug: print("  → earcut failed all rings")
+        if debug: print("  -> earcut failed all rings")
         return None
 
     new_faces = np.vstack(all_new_faces)
     old_n, new_n = len(face_indices), len(new_faces)
     if debug:
-        print(f"  {old_n}→{new_n} {chr(9660) if new_n < old_n else chr(9650)}", end="")
+        print(f"  {old_n}->{new_n} {'v' if new_n < old_n else '^'}", end="")
 
     if new_n >= old_n:
         if debug: print("  no gain")
@@ -671,6 +729,74 @@ def apply_replacement(mesh, face_indices_to_remove, new_faces, fix_norms=False):
 # ─────────────────────────────────────────────────────────────────────────────
 # Full pipeline
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _pack_edges_raw(faces, n_verts):
+    """Pack all three edges of each face into sorted int64 keys."""
+    f = faces
+    a0 = np.minimum(f[:,0], f[:,1]).astype(np.int64)
+    b0 = np.maximum(f[:,0], f[:,1]).astype(np.int64)
+    a1 = np.minimum(f[:,1], f[:,2]).astype(np.int64)
+    b1 = np.maximum(f[:,1], f[:,2]).astype(np.int64)
+    a2 = np.minimum(f[:,2], f[:,0]).astype(np.int64)
+    b2 = np.maximum(f[:,2], f[:,0]).astype(np.int64)
+    n  = np.int64(n_verts)
+    return np.concatenate([a0*n+b0, a1*n+b1, a2*n+b2])
+
+
+class EdgeCounter:
+    """
+    Incrementally maintained edge→count dict for O(delta) watertight checks.
+    A mesh is watertight iff every edge count is exactly 2.
+
+    try_apply_batch(swaps) atomically attempts a list of (old_faces, new_faces)
+    swaps.  On success it updates self in-place and returns True.  On failure it
+    rolls back every change and returns False.
+    """
+    __slots__ = ('n_verts', '_counts')
+
+    def __init__(self, faces):
+        self.n_verts = int(faces.max()) + 1
+        packed = _pack_edges_raw(faces, self.n_verts)
+        keys, counts = np.unique(packed, return_counts=True)
+        self._counts = dict(zip(keys.tolist(), counts.tolist()))
+
+    def try_apply_batch(self, swaps):
+        if not swaps:
+            return True
+        n = self.n_verts
+
+        # Stack all old/new faces into single arrays → one _pack_edges_raw call each
+        # instead of len(swaps) individual calls + concatenate.
+        old_faces = np.vstack([o  for o,  _ in swaps])
+        new_faces = np.vstack([nf for _, nf in swaps])
+        rem_raw = _pack_edges_raw(old_faces, n)
+        add_raw = _pack_edges_raw(new_faces, n)
+
+        # Use Counter so inner loops iterate over unique edges, not all occurrences.
+        rem_cnt = Counter(rem_raw.tolist())
+        add_cnt = Counter(add_raw.tolist())
+
+        affected = set(rem_cnt.keys()) | set(add_cnt.keys())
+        c        = self._counts
+        snapshot = {e: c.get(e, 0) for e in affected}
+
+        for e, cnt in rem_cnt.items():
+            v = c.get(e, 0) - cnt
+            if v <= 0: c.pop(e, None)
+            else:      c[e] = v
+        for e, cnt in add_cnt.items():
+            c[e] = c.get(e, 0) + cnt
+
+        # Valid states: 0 (interior edge removed by merge) or 2 (manifold).
+        # Count 1 = open edge; count > 2 = non-manifold — both invalid.
+        valid = all(c.get(e, 0) in (0, 2) for e in affected)
+        if not valid:
+            for e, v in snapshot.items():
+                if v == 0: c.pop(e, None)
+                else:      c[e] = v
+            return False
+        return True
+
 
 def pack_faces(faces):
     """Pack sorted face vertex indices into int64 keys for fast lookup.
@@ -721,72 +847,104 @@ def validate(candidate):
     return bool(np.all(counts == 2))
 
 
-def apply_and_validate_batch(base_mesh, pending, debug=False, _lookup=None):
+def apply_and_validate_batch(base_mesh, pending, debug=False, _lookup=None, _ec=None):
     """
-    Try to apply all pending replacements. If the combined result fails,
-    bisect: try first half, then second half, rolling back the bad half.
-    pending items: (face_keys, new_faces)
+    Try to apply all pending replacements using incremental edge counting.
+    If the combined result fails, bisect: try first half then second half.
+    EdgeCounter (_ec) is updated in-place on success and rolled back on failure,
+    so the caller never needs to rebuild it.
     Returns (accepted_mesh, n_accepted, n_rolled).
     """
     if not pending:
         return base_mesh, 0, 0
 
-    # Build lookup once for this base_mesh — reused across all bisect calls
     if _lookup is None:
         _lookup = build_lookup(base_mesh.faces)
+    if _ec is None:
+        _ec = EdgeCounter(base_mesh.faces)
+
+    def _resolve(face_keys):
+        idx = [_lookup[k] for k in face_keys if k in _lookup]
+        return np.array(idx, dtype=np.int64) if len(idx) == len(face_keys) else None
 
     if len(pending) == 1:
-        candidate = apply_batch(base_mesh, pending, lookup=_lookup)
-        if validate(candidate):
-            if debug: print(f"    [batch-1] ✅")
-            return candidate, 1, 0
-        else:
-            if debug: print(f"    [batch-1] ❌ → rolled back")
-            return base_mesh, 0, 1
+        face_keys, new_faces = pending[0]
+        idx = _resolve(face_keys)
+        if idx is None:
+            return base_mesh, 0, 1  # stale
+        old_faces = base_mesh.faces[idx]
+        if _ec.try_apply_batch([(old_faces, new_faces)]):
+            keep  = np.ones(len(base_mesh.faces), dtype=bool)
+            keep[idx] = False
+            m = trimesh.Trimesh(vertices=base_mesh.vertices.copy(),
+                                faces=np.vstack([base_mesh.faces[keep], new_faces]),
+                                process=False)
+            if debug: print(f"    [batch-1] [OK]")
+            return m, 1, 0
+        if debug: print(f"    [batch-1] [!!] -> rolled back")
+        return base_mesh, 0, 1
 
-    # Try whole batch first
-    candidate = apply_batch(base_mesh, pending, lookup=_lookup)
-    if validate(candidate):
-        if debug: print(f"    [batch-{len(pending)}] ✅ all accepted")
-        return candidate, len(pending), 0
+    # Resolve all face indices; any staleness falls through to bisect
+    items      = []
+    has_stale  = False
+    for face_keys, new_faces in pending:
+        idx = _resolve(face_keys)
+        if idx is None:
+            has_stale = True
+        items.append((idx, new_faces))
 
-    # Batch failed — bisect
-    if debug: print(f"    [batch-{len(pending)}] ❌ → bisecting")
-    mid = len(pending) // 2
-    left, right = pending[:mid], pending[mid:]
+    if not has_stale:
+        # Try whole batch atomically via EdgeCounter (rolls back automatically on fail)
+        swaps = [(base_mesh.faces[idx], nf) for idx, nf in items]
+        if _ec.try_apply_batch(swaps):
+            keep = np.ones(len(base_mesh.faces), dtype=bool)
+            nfl  = []
+            for idx, nf in items:
+                keep[idx] = False
+                nfl.append(nf)
+            m = trimesh.Trimesh(vertices=base_mesh.vertices.copy(),
+                                faces=np.vstack([base_mesh.faces[keep]] + nfl),
+                                process=False)
+            if debug: print(f"    [batch-{len(pending)}] [OK] all accepted")
+            return m, len(pending), 0
 
-    # Left half uses current lookup; right half needs new lookup after left applied
-    mesh_after_left, n_left, r_left = apply_and_validate_batch(
-        base_mesh, left, debug, _lookup=_lookup)
+    # Bisect — _ec is unchanged (rolled back by try_apply_batch or never modified)
+    if debug: print(f"    [batch-{len(pending)}] [!!] -> bisecting")
+    mid  = len(pending) // 2
+    left = pending[:mid]
+    right= pending[mid:]
 
-    # Build new lookup for right half against the post-left mesh
-    right_lookup = build_lookup(mesh_after_left.faces)
-    mesh_final, n_right, r_right = apply_and_validate_batch(
-        mesh_after_left, right, debug, _lookup=right_lookup)
+    mesh_l, n_l, r_l = apply_and_validate_batch(base_mesh, left,   debug, _lookup,                      _ec)
+    rlookup           = build_lookup(mesh_l.faces)
+    mesh_f, n_r, r_r = apply_and_validate_batch(mesh_l,    right,  debug, rlookup,                      _ec)
 
-    return mesh_final, n_left + n_right, r_left + r_right
+    return mesh_f, n_l + n_r, r_l + r_r
 
 
-def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
+def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=256,
                         force_fail_test=False):
     t0 = time.perf_counter()
 
-    print("\n" + "═"*62)
+    print("\n" + "="*62)
     print("  COPLANAR MERGE PASS")
-    print("═"*62)
+    print("="*62)
     face_info(mesh, "pass-input")
 
+    _ta = time.perf_counter()
     components = cluster_axis_aligned(mesh, dist_tol=dist_tol)
+    t_cluster = time.perf_counter() - _ta
     if not components:
         print("[merge] No eligible components.")
         return mesh
 
     # Pre-compute face content keys for stable resolution across merges
     # Pre-compute packed int64 face keys for each component
+    _ta = time.perf_counter()
     all_keys, _ = pack_faces(mesh.faces)
     component_face_keys = []
     for axis_id, face_indices in components:
         component_face_keys.append(all_keys[face_indices].tolist())
+    t_precomp = time.perf_counter() - _ta
 
     current  = mesh.copy()
     saved    = 0
@@ -799,15 +957,21 @@ def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
     n_validate = 0
 
     # Face lookup: packed_int64 → row in current.faces
+    _ta = time.perf_counter()
     current_face_lookup = build_lookup(current.faces)
+    t_init_lookup = time.perf_counter() - _ta
+    # EdgeCounter: maintained incrementally — O(delta) per batch instead of O(all_faces)
+    _ta = time.perf_counter()
+    current_ec = EdgeCounter(current.faces)
+    t_init_ec = time.perf_counter() - _ta
 
-    print(f"\n[merge] {len(components):,} components, batch_size={batch_size} …\n")
+    print(f"\n[merge] {len(components):,} components, batch_size={batch_size} ...\n")
 
     # Collect pending replacements; flush when batch is full or at end
     pending = []  # list of (face_keys, new_faces)
 
     def flush_batch(force_fail=False):
-        nonlocal current, current_face_lookup, accepted, rolled, saved, t_validate, n_validate
+        nonlocal current, current_face_lookup, current_ec, accepted, rolled, saved, t_validate, n_validate
         if not pending:
             return
 
@@ -821,14 +985,16 @@ def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
             print(f"  [TEST] Injecting bad faces into last replacement to force failure")
 
         _t = time.perf_counter()
-        current, n_acc, n_roll = apply_and_validate_batch(current, batch, debug=debug)
+        current, n_acc, n_roll = apply_and_validate_batch(
+            current, batch, debug=debug,
+            _lookup=current_face_lookup, _ec=current_ec)
         t_validate += time.perf_counter() - _t
         n_validate += n_acc + n_roll  # approximate call count
 
         accepted += n_acc
         rolled   += n_roll
 
-        # Rebuild lookup after batch
+        # Rebuild face-content lookup after batch (current_ec already updated in-place)
         current_face_lookup.clear()
         current_face_lookup.update(build_lookup(current.faces))
 
@@ -845,7 +1011,7 @@ def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
 
         if len(face_indices) < len(face_keys):
             if debug:
-                print(f"[C{cid:05d}] {AXIS_LABELS[axis_id]} n={len(face_keys):4d} → stale")
+                print(f"[C{cid:05d}] {AXIS_LABELS[axis_id]} n={len(face_keys):4d} -> stale")
             skipped += 1
             continue
 
@@ -868,7 +1034,7 @@ def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
 
         delta = len(new_faces) - len(face_indices)
         pending.append((face_keys, new_faces))
-        if debug: print(f"  queued (Δ={delta:+d})")
+        if debug: print(f"  queued (d={delta:+d})")
 
         if len(pending) >= batch_size:
             flush_batch(force_fail=force_fail_test and len(pending) >= batch_size)
@@ -882,20 +1048,22 @@ def merge_coplanar_pass(mesh, dist_tol=1e-4, debug=True, batch_size=32,
     current.remove_unreferenced_vertices()
 
     elapsed = time.perf_counter() - t0
-    print(f"\n{'═'*62}")
+    print(f"\n{'='*62}")
     print(f"  PASS DONE  ({elapsed:.1f}s)")
     print(f"  in={len(mesh.faces):,}  out={len(current.faces):,}  "
           f"saved={saved:,} ({100*saved/max(len(mesh.faces),1):.1f}%)")
     print(f"  accepted={accepted}  rolled={rolled}  skipped={skipped}")
+    print(f"[timing] cluster: {t_cluster:.2f}s  precomp: {t_precomp:.2f}s  "
+          f"init_lookup: {t_init_lookup:.2f}s  init_ec: {t_init_ec:.2f}s")
     print(f"[timing] lookup: {t_lookup:.2f}s  merge: {t_merge:.2f}s  "
           f"validate: {t_validate:.2f}s ({n_validate} calls)")
     face_info(current, "pass-output")
-    print("═"*62)
+    print("="*62)
     return current
 
 
 def run(input_path, output_path, passes=1, dist_tol=1e-4, debug=True,
-        batch_size=32, force_fail_test=False):
+        batch_size=256, force_fail_test=False):
     print(f"\n{'#'*62}")
     print(f"  {input_path}")
     print(f"{'#'*62}\n")
@@ -910,13 +1078,13 @@ def run(input_path, output_path, passes=1, dist_tol=1e-4, debug=True,
 
     current = mesh
     for p in range(1, passes + 1):
-        print(f"\n{'━'*62}  PASS {p}/{passes}  {'━'*62}")
+        print(f"\n{'-'*62}  PASS {p}/{passes}  {'-'*62}")
         before  = len(current.faces)
         current = merge_coplanar_pass(current, dist_tol=dist_tol, debug=debug,
                                       batch_size=batch_size,
                                       force_fail_test=force_fail_test)
         if len(current.faces) >= before:
-            print(f"[run] Pass {p}: no reduction – stopping.")
+            print(f"[run] Pass {p}: no reduction -- stopping.")
             break
 
     # Ensure consistent winding before export — is_watertight can pass with
@@ -924,7 +1092,7 @@ def run(input_path, output_path, passes=1, dist_tol=1e-4, debug=True,
     if not current.is_volume:
         current.fix_normals()
 
-    print(f"\n[export] → {output_path}")
+    print(f"\n[export] -> {output_path}")
     current.export(output_path)
     face_info(current, "final")
     print("[export] Done.\n")
@@ -955,8 +1123,8 @@ if __name__ == "__main__":
     ap.add_argument("--passes",        type=int,   default=1)
     ap.add_argument("--dist-tol",      type=float, default=1e-4)
     ap.add_argument("--quiet",         action="store_true")
-    ap.add_argument("--batch-size",    type=int,   default=32,
-                    help="Number of merges to validate at once (default 32)")
+    ap.add_argument("--batch-size",    type=int,   default=256,
+                    help="Number of merges to validate at once (default 256)")
     ap.add_argument("--force-fail-test", action="store_true",
                     help="Inject a bad face into one batch to test rollback")
     ap.add_argument("--diagnose", type=str, default=None,

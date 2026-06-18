@@ -15,9 +15,9 @@ RED    = "\033[91m"
 GREEN  = "\033[92m"
 RESET  = "\033[0m"
 
-def warn(msg): print(f"{YELLOW}  WARNING: {msg}{RESET}", flush=True)
-def err(msg):  print(f"{RED}  ERROR: {msg}{RESET}",   flush=True)
-def ok(msg):   print(f"{GREEN}  OK: {msg}{RESET}",     flush=True)
+def warn(msg): tqdm.write(f"{YELLOW}  WARNING: {msg}{RESET}")
+def err(msg):  tqdm.write(f"{RED}  ERROR: {msg}{RESET}")
+def ok(msg):   tqdm.write(f"{GREEN}  OK: {msg}{RESET}")
 
 DEBUG = '--debug' in sys.argv
 args  = [a for a in sys.argv[1:] if not a.startswith('--')]
@@ -47,7 +47,7 @@ def save_debug(mesh, label):
     try:
         mesh.export(path)
         debug_counter[0] += 1
-        print(f"  [debug] → {path}  faces={len(mesh.faces)} watertight={mesh.is_watertight}")
+        print(f"  [debug] -> {path}  faces={len(mesh.faces)} watertight={mesh.is_watertight}")
     except Exception as e:
         warn(f"debug export failed for {label}: {e}")
 
@@ -65,11 +65,11 @@ def smart_decimate(mesh, target_faces, label=""):
         return mesh
 
     ratio = target_faces / current
-    print(f"  [decimate] {label}: {current:,} → {target_faces:,} faces ({ratio:.1%})", flush=True)
+    print(f"  [decimate] {label}: {current:,} -> {target_faces:,} faces ({ratio:.1%})", flush=True)
     try:
         result = mesh.simplify_quadric_decimation(face_count=target_faces)
         if result is not None and len(result.faces) > 0:
-            ok(f"  [decimate] {label}: done → {len(result.faces):,} faces  wt={result.is_watertight}")
+            ok(f"  [decimate] {label}: done -> {len(result.faces):,} faces  wt={result.is_watertight}")
             return result
         else:
             warn(f"  [decimate] {label}: returned empty mesh, keeping original")
@@ -277,7 +277,7 @@ while len(intermediate_meshes) > 1:
     pairs       = list(zip(intermediate_meshes[0::2], intermediate_meshes[1::2]))
     leftover    = intermediate_meshes[-1] if len(intermediate_meshes) % 2 else None
 
-    print(f"  Round {round_num}: {len(intermediate_meshes)} → {len(pairs) + (1 if leftover else 0)}")
+    print(f"  Round {round_num}: {len(intermediate_meshes)} -> {len(pairs) + (1 if leftover else 0)}")
 
     for i, (a, b) in enumerate(tqdm(pairs, desc=f"  round {round_num}")):
         merged = union_safe(a, b, label=f"r{round_num}p{i}")
@@ -322,6 +322,6 @@ if FINAL_FACES > 0 and len(combined.faces) > FINAL_FACES:
 
 save_debug(combined, "FINAL")
 
-print(f"\nExporting → {OUTPUT_FILE}")
+print(f"\nExporting -> {OUTPUT_FILE}")
 combined.export(OUTPUT_FILE)
 print("Done")
